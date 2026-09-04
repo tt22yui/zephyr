@@ -28,6 +28,8 @@ pub const PROGRESS_EVENT: &str = "pull://progress";
 /// 推送给前端的进度负载。
 #[derive(Clone, Serialize)]
 pub struct ProgressPayload {
+    /// 所属下载任务的唯一标识，前端据此把进度归位到下载列表中的对应任务。
+    pub task_id: String,
     /// 阶段/事件名：auth / manifest / config / blob / write。
     pub name: String,
     /// 已完成量。
@@ -152,9 +154,12 @@ pub async fn pull(
 }
 
 /// 暴露给前端的命令。`app` 由 Tauri 注入，用于推送进度事件。
+///
+/// `task_id` 由前端生成并随进度事件原样回传，用于后台多任务并发时按任务归位进度。
 #[tauri::command]
 pub async fn pull_image(
     app: tauri::AppHandle,
+    task_id: String,
     image: String,
     out_file: Option<String>,
     out_dir: Option<String>,
@@ -169,6 +174,7 @@ pub async fn pull_image(
     let app2 = app.clone();
     let progress = move |name: &str, done: u64, total: u64| {
         let payload = ProgressPayload {
+            task_id: task_id.clone(),
             name: name.to_string(),
             done,
             total,

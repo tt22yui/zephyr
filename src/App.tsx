@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -52,23 +52,34 @@ interface InspectResult {
   layer_count: number;
   total_size: number;
 }
+interface ProgressPayload {
+  task_id: string;
+  name: string;
+  done: number;
+  total: number;
+  message: string;
+}
 interface PullResult {
   top_id: string;
   layer_count: number;
   tar_path: string;
   image: string;
 }
-interface ProgressPayload {
-  name: string;
-  done: number;
-  total: number;
-  message: string;
-}
 
-type PullView =
-  | { kind: "running"; progress: ProgressPayload; log: string[] }
-  | { kind: "error"; raw: string; message: string }
-  | { kind: "result"; data: PullResult };
+/** 后台下载队列中的单个任务。 */
+interface DownloadTask {
+  id: string;
+  image: string;
+  arch: string;
+  useHttp: boolean;
+  status: "queued" | "running" | "done" | "error";
+  /** 最近一次收到的进度（running 时持续更新）。 */
+  progress: ProgressPayload | null;
+  log: string[];
+  result?: PullResult;
+  errorRaw?: string;
+  errorMessage?: string;
+}
 
 type Stage =
   | { kind: "home" }
@@ -78,8 +89,7 @@ type Stage =
       image: string;
       /** 进入详情前所在的搜索结果上下文；为 null 表示直接从首页进来。 */
       from: { query: string; sourceUrl: string | null } | null;
-    }
-  | { kind: "pull"; image: string; view: PullView; arch: string };
+    };
 
 /* ================= 存储与工具 ================= */
 
@@ -91,6 +101,7 @@ const STORE = {
   registries: "dpt.registries",
   accounts: "dpt.accounts",
   downloadDir: "dpt.downloadDir",
+  concurrency: "dpt.concurrency",
 };
 
 function load<T>(key: string, fallback: T): T {
@@ -203,12 +214,27 @@ function App() {
   const [registries, setRegistries] = useState<RegistryCfg[]>(() => load(STORE.registries, []));
   const [accounts, setAccounts] = useState<AccountCfg[]>(() => load(STORE.accounts, []));
   const [downloadDir, setDownloadDir] = useState<string>(() => load(STORE.downloadDir, ""));
+  const [concurrency, setConcurrency] = useState<number>(() => load(STORE.concurrency, 3));
+  const [tasks, setTasks] = useState<DownloadTask[]>([]);
+  const [downloadsOpen, setDownloadsOpen] = useState(false);
+
+  // 任务数组与并发数的同步 ref：调度器（kick/startTask）需要即时读取最新值，
+  // 而 setState 是异步的，故所有对 tasks 的修改统一走 patchTasks 同步更新 ref。
+  const tasksRef = useRef<DownloadTask[]>(tasks);
+  const concurrencyRef = useRef(concurrency);
+  useEffect(() => {
+    tasksRef.current = tasks;
+  }, [tasks]);
+  useEffect(() => {
+    concurrencyRef.current = concurrency;
+  }, [concurrency]);
 
   useEffect(() => save(STORE.arch, arch), [arch]);
   useEffect(() => save(STORE.source, source), [source]);
   useEffect(() => save(STORE.registries, registries), [registries]);
   useEffect(() => save(STORE.accounts, accounts), [accounts]);
   useEffect(() => save(STORE.downloadDir, downloadDir), [downloadDir]);
+  useEffect(() => save(STORE.concurrency, concurrency), [concurrency]);
 
   // 首次未配置下载目录时，默认取系统「下载」目录。
   useEffect(() => {
@@ -223,26 +249,6 @@ function App() {
     }
   }, []);
 
-  // 进度事件 → 更新 pull 阶段
-  useEffect(() => {
-    let unlisten: (() => void) | null = null;
-    listen<ProgressPayload>("pull://progress", (ev) => {
-      setStage((prev) =>
-        prev.kind === "pull" && prev.view.kind === "running"
-          ? {
-              ...prev,
-              view: {
-                ...prev.view,
-                progress: ev.payload,
-                log: [...prev.view.log.slice(-29), ev.payload.message],
-              },
-            }
-          : prev,
-      );
-    }).then((fn) => (unlisten = fn));
-    return () => unlisten?.();
-  }, []);
-
   /** 查找与某镜像 registry host 匹配的账号。 */
   const accountFor = useCallback(
     (ref: string): AccountCfg | undefined => {
@@ -252,29 +258,125 @@ function App() {
     [accounts],
   );
 
-  /** 发起实际拉取。输出到设置的「下载目录」，未配置时由后端回退到当前目录。 */
-  const runPull = useCallback(
-    async (image: string, targetArch: string, useHttp: boolean) => {
-      const acc = accountFor(image);
-      const rec = {
-        image,
-        arch: targetArch,
-        useHttp: useHttp || null,
-        username: acc?.username || null,
-        password: acc?.password || null,
-        outDir: downloadDir || null,
-      };
-      setStage({ kind: "pull", image, view: { kind: "running", progress: { name: "auth", done: 0, total: 1, message: "准备开始…" }, log: ["准备开始…"] }, arch: targetArch });
-      try {
-        const r = await invoke<PullResult>("pull_image", rec);
-        setStage({ kind: "pull", image, view: { kind: "result", data: r }, arch: targetArch });
-      } catch (err) {
+  /** 统一修改任务数组：同步更新 ref 与 state，保证调度器能立即读到最新队列。 */
+  const patchTasks = useCallback((fn: (prev: DownloadTask[]) => DownloadTask[]) => {
+    const next = fn(tasksRef.current);
+    tasksRef.current = next;
+    setTasks(next);
+  }, []);
+
+  // 进度事件 → 按 task_id 归位到下载列表中的对应任务
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    listen<ProgressPayload>("pull://progress", (ev) => {
+      const id = ev.payload.task_id;
+      patchTasks((prev) =>
+        prev.map((t) =>
+          t.id === id ? { ...t, progress: ev.payload, log: [...t.log.slice(-29), ev.payload.message] } : t,
+        ),
+      );
+    }).then((fn) => (unlisten = fn));
+    return () => unlisten?.();
+  }, [patchTasks]);
+
+  /** 启动一个排队任务：标 running 后调用后端，完成/失败后调度下一个。 */
+  const startTask = (id: string) => {
+    const task = tasksRef.current.find((t) => t.id === id);
+    if (!task || task.status !== "queued") return;
+    patchTasks((prev) =>
+      prev.map((t) =>
+        t.id === id
+          ? {
+              ...t,
+              status: "running",
+              progress: { task_id: id, name: "auth", done: 0, total: 1, message: "准备开始…" },
+              log: ["准备开始…"],
+            }
+          : t,
+      ),
+    );
+    const acc = accountFor(task.image);
+    invoke<PullResult>("pull_image", {
+      taskId: id,
+      image: task.image,
+      arch: task.arch,
+      useHttp: task.useHttp || null,
+      username: acc?.username || null,
+      password: acc?.password || null,
+      outDir: downloadDir || null,
+    })
+      .then((r) => {
+        patchTasks((prev) => prev.map((t) => (t.id === id ? { ...t, status: "done", result: r } : t)));
+        kick();
+      })
+      .catch((err) => {
         const raw = String(err);
-        setStage({ kind: "pull", image, view: { kind: "error", raw, message: friendlyError(raw) }, arch: targetArch });
-      }
-    },
-    [accountFor, downloadDir],
-  );
+        patchTasks((prev) =>
+          prev.map((t) =>
+            t.id === id ? { ...t, status: "error", errorRaw: raw, errorMessage: friendlyError(raw) } : t,
+          ),
+        );
+        kick();
+      });
+  };
+
+  /** 并发调度：运行中未达上限时，从队列中补足启动。 */
+  const kick = () => {
+    const cur = tasksRef.current;
+    const running = cur.filter((t) => t.status === "running").length;
+    const slots = Math.max(0, concurrencyRef.current - running);
+    if (slots <= 0) return;
+    for (const t of cur.filter((x) => x.status === "queued").slice(0, slots)) {
+      startTask(t.id);
+    }
+  };
+
+  /** 加入后台下载队列（前台不跳转）。 */
+  const enqueue = (image: string, targetArch: string, useHttp: boolean) => {
+    const task: DownloadTask = {
+      id: uid(),
+      image,
+      arch: targetArch,
+      useHttp,
+      status: "queued",
+      progress: null,
+      log: [],
+    };
+    patchTasks((prev) => [...prev, task]);
+    kick();
+  };
+
+  /** 失败任务重试：重置为排队状态并重新调度。 */
+  const retryTask = (id: string) => {
+    patchTasks((prev) =>
+      prev.map((t) =>
+        t.id === id && t.status === "error"
+          ? {
+              ...t,
+              status: "queued",
+              progress: null,
+              log: [],
+              result: undefined,
+              errorRaw: undefined,
+              errorMessage: undefined,
+            }
+          : t,
+      ),
+    );
+    kick();
+  };
+
+  /** 删除单个任务（运行中的不允许删除）。 */
+  const removeTask = (id: string) => {
+    const task = tasksRef.current.find((t) => t.id === id);
+    if (!task || task.status === "running") return;
+    patchTasks((prev) => prev.filter((t) => t.id !== id));
+  };
+
+  /** 清空所有已完成/失败任务。 */
+  const clearDone = () => {
+    patchTasks((prev) => prev.filter((t) => t.status === "queued" || t.status === "running"));
+  };
 
   function pushHistory(img: string) {
     const next = [...load<string[]>(STORE.history, []).filter((h) => h !== img), img].slice(-8);
@@ -307,24 +409,19 @@ function App() {
       </>
     ) : stage.kind === "detail" ? (
       <span className="mono">{stage.image}</span>
-    ) : stage.kind === "pull" ? (
-      <span className="mono">
-        {stage.image}
-        {stage.arch ? ` (${stage.arch})` : ""}
-      </span>
     ) : null;
 
   return (
     <div className="app">
       <TopBar
-        busy={stage.kind === "pull" && stage.view.kind === "running"}
-        pullMessage={stage.kind === "pull" && stage.view.kind === "running" ? stage.view.progress.message : ""}
         source={source}
         setSource={setSource}
         arch={arch}
         setArch={setArch}
         registries={registries}
         onSettings={() => setSettingsOpen(true)}
+        downloadCount={tasks.filter((t) => t.status === "queued" || t.status === "running").length}
+        onDownloads={() => setDownloadsOpen(true)}
         canGoBack={stage.kind !== "home"}
         onBack={goBack}
         showHome={stage.kind === "detail"}
@@ -369,7 +466,7 @@ function App() {
             }
             onPull={(name) => {
               pushHistory(name);
-              void runPull(name, concreteArch(arch), false);
+              enqueue(name, concreteArch(arch), false);
             }}
           />
         )}
@@ -381,15 +478,8 @@ function App() {
             account={accountFor(stage.image)}
             onDownload={(img, targetArch, useHttp) => {
               pushHistory(img);
-              void runPull(img, targetArch, useHttp);
+              enqueue(img, targetArch, useHttp);
             }}
-          />
-        )}
-
-        {stage.kind === "pull" && (
-          <PullView
-            view={stage.view}
-            onRetry={() => runPull(stage.image, stage.arch, false)}
           />
         )}
       </main>
@@ -404,6 +494,17 @@ function App() {
         downloadDir={downloadDir}
         setDownloadDir={setDownloadDir}
       />
+
+      <DownloadsDrawer
+        open={downloadsOpen}
+        onClose={() => setDownloadsOpen(false)}
+        tasks={tasks}
+        concurrency={concurrency}
+        setConcurrency={setConcurrency}
+        onRetry={retryTask}
+        onRemove={removeTask}
+        onClearDone={clearDone}
+      />
     </div>
   );
 }
@@ -411,14 +512,15 @@ function App() {
 /* ================= 顶栏 ================= */
 
 interface TopBarProps {
-  busy: boolean;
-  pullMessage: string;
   source: string;
   setSource: (s: string) => void;
   arch: Arch;
   setArch: (a: Arch) => void;
   registries: RegistryCfg[];
   onSettings: () => void;
+  /** 排队中 + 下载中的任务数，>0 时在下载按钮上显示角标。 */
+  downloadCount: number;
+  onDownloads: () => void;
   canGoBack: boolean;
   onBack: () => void;
   showHome: boolean;
@@ -426,7 +528,7 @@ interface TopBarProps {
   title: ReactNode;
 }
 
-function TopBar({ busy, pullMessage, source, setSource, arch, setArch, registries, onSettings, canGoBack, onBack, showHome, onGoHome, title }: TopBarProps) {
+function TopBar({ source, setSource, arch, setArch, registries, onSettings, downloadCount, onDownloads, canGoBack, onBack, showHome, onGoHome, title }: TopBarProps) {
   return (
     <header className="topbar">
       <div className="topbar-left">
@@ -449,12 +551,6 @@ function TopBar({ busy, pullMessage, source, setSource, arch, setArch, registrie
         {title && <span className="topbar-title">{title}</span>}
       </div>
       <div className="topbar-right">
-        {busy && (
-          <div className="busy">
-            <span className="spinner" aria-hidden="true" />
-            {pullMessage}
-          </div>
-        )}
         <select
           className="top-select"
           value={source}
@@ -479,6 +575,14 @@ function TopBar({ busy, pullMessage, source, setSource, arch, setArch, registrie
           <option value="amd64">amd64</option>
           <option value="arm64">arm64</option>
         </select>
+        <button className="icon-btn dl-entry" type="button" onClick={onDownloads} title="下载列表" aria-label="下载列表">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+            <path d="m7 10 5 5 5-5" />
+            <path d="M12 15V3" />
+          </svg>
+          {downloadCount > 0 && <span className="dl-badge">{downloadCount}</span>}
+        </button>
         <button className="icon-btn" type="button" onClick={onSettings} title="设置（三方库 / 账号）" aria-label="设置">
           <span className="gear" aria-hidden="true">⚙</span>
         </button>
@@ -813,88 +917,176 @@ function onSelectTag(
   void onDownload(full, "amd64", false);
 }
 
-function PullView({
-  view,
-  onRetry,
-}: {
-  view: PullView;
-  onRetry: () => void;
-}) {
+/* ================= 下载列表抽屉（downloads） ================= */
+
+interface DownloadsProps {
+  open: boolean;
+  onClose: () => void;
+  tasks: DownloadTask[];
+  concurrency: number;
+  setConcurrency: (n: number) => void;
+  onRetry: (id: string) => void;
+  onRemove: (id: string) => void;
+  onClearDone: () => void;
+}
+
+function DownloadsDrawer({ open, onClose, tasks, concurrency, setConcurrency, onRetry, onRemove, onClearDone }: DownloadsProps) {
+  if (!open) return null;
+  const active = tasks.filter((t) => t.status === "queued" || t.status === "running").length;
+  const finished = tasks.filter((t) => t.status === "done" || t.status === "error").length;
   return (
-    <div className="rail-full">
-      {view.kind === "running" && <ProgressView progress={view.progress} log={view.log} />}
-      {view.kind === "error" && (
-        <div className="state state-error">
-          <p className="state-title">拉取失败</p>
-          <p className="error-message">{view.message}</p>
-          <details className="raw-error">
-            <summary>查看原始错误</summary>
-            <pre className="error-text">{view.raw}</pre>
-          </details>
-          <div className="state-actions">
-            <button className="ghost" type="button" onClick={onRetry}>
-              重新拉取
+    <div className="drawer-mask" onClick={onClose}>
+      <aside className="drawer" onClick={(e) => e.stopPropagation()} aria-label="下载列表">
+        <div className="drawer-head">
+          <h2 className="drawer-title">下载列表</h2>
+          <button className="ghost" type="button" onClick={onClose}>
+            关闭
+          </button>
+        </div>
+
+        <section className="settings-sec">
+          <div className="dl-controls">
+            <label className="field grow">
+              <span className="field-label">最大并发</span>
+              <select
+                className="mono"
+                value={concurrency}
+                onChange={(e) => setConcurrency(Number(e.currentTarget.value))}
+                aria-label="最大并发数"
+              >
+                {[1, 2, 3, 4, 5].map((n) => (
+                  <option key={n} value={n}>
+                    {n}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <button className="ghost" type="button" onClick={onClearDone} disabled={finished === 0} title="清除已完成与失败任务">
+              清空已完成
             </button>
           </div>
+          <p className="settings-hint">
+            {active > 0
+              ? `进行中 ${active} 个任务（含排队），完成后可在此复制导入命令。`
+              : finished > 0
+                ? `${finished} 个任务已结束。`
+                : "暂无下载任务。"}
+          </p>
+        </section>
+
+        {tasks.length === 0 ? (
+          <p className="search-empty">暂无下载任务。在镜像列表或详情页点击「下载」即可加入后台队列，前台不跳转。</p>
+        ) : (
+          <ul className="dl-list">
+            {tasks.map((t) => (
+              <TaskItem key={t.id} task={t} onRetry={onRetry} onRemove={onRemove} />
+            ))}
+          </ul>
+        )}
+      </aside>
+    </div>
+  );
+}
+
+/** 下载列表中的单个任务卡片。 */
+function TaskItem({
+  task,
+  onRetry,
+  onRemove,
+}: {
+  task: DownloadTask;
+  onRetry: (id: string) => void;
+  onRemove: (id: string) => void;
+}) {
+  const pct =
+    task.progress && task.progress.total > 0
+      ? Math.min(100, Math.round((task.progress.done / task.progress.total) * 100))
+      : 0;
+  return (
+    <li className={`dl-item dl-${task.status}`}>
+      <div className="dl-item-head">
+        <span className="dl-name mono" title={task.image}>
+          {task.image}
+        </span>
+        <span className={`dl-status dl-status-${task.status}`}>{statusLabel(task.status)}</span>
+      </div>
+      <p className="dl-arch mono">{task.arch}</p>
+
+      {task.status === "running" && task.progress && (
+        <>
+          <div className="bar dl-bar">
+            <div className="bar-fill" style={{ width: `${pct}%` }} />
+          </div>
+          <p className="dl-message">{task.progress.message}</p>
+          {task.log.length > 0 && (
+            <details className="raw-error">
+              <summary>查看日志</summary>
+              <ul className="log dl-log">
+                {task.log.map((line, i) => (
+                  <li key={i}>{line}</li>
+                ))}
+              </ul>
+            </details>
+          )}
+        </>
+      )}
+
+      {task.status === "done" && task.result && (
+        <div className="dl-result">
+          <code className="mono dl-path" title={task.result.tar_path}>
+            {task.result.tar_path}
+          </code>
+          <button
+            className="ghost copy"
+            type="button"
+            onClick={() => {
+              void navigator.clipboard.writeText(`docker load -i ${task.result!.tar_path}`);
+            }}
+          >
+            复制命令
+          </button>
         </div>
       )}
-      {view.kind === "result" && <ResultCard data={view.data} />}
-    </div>
-  );
-}
 
-function ResultCard({ data }: { data: PullResult }) {
-  async function copyCmd() {
-    await navigator.clipboard.writeText(`docker load -i ${data.tar_path}`);
-  }
-  return (
-    <div className="result">
-      <div className="result-head">
-        <span className="ok-dot" aria-hidden="true" />
-        <span className="result-title">拉取完成</span>
-      </div>
-      <dl className="kv">
-        <dt>镜像</dt>
-        <dd className="mono">{data.image}</dd>
-        <dt>镜像 ID</dt>
-        <dd className="mono">{data.top_id}</dd>
-        <dt>层数</dt>
-        <dd className="mono">{data.layer_count}</dd>
-        <dt>输出</dt>
-        <dd className="mono">{data.tar_path}</dd>
-      </dl>
-      <div className="cmd-line">
-        <code className="mono cmd-text">docker load -i {data.tar_path}</code>
-        <button className="ghost copy" type="button" onClick={copyCmd}>
-          复制命令
-        </button>
-      </div>
-      <p className="hint">之后用 <code>docker load -i …</code> 即可导入该 tar。</p>
-    </div>
-  );
-}
-
-function ProgressView({ progress, log }: { progress: ProgressPayload; log: string[] }) {
-  const pct = progress.total > 0 ? Math.min(100, Math.round((progress.done / progress.total) * 100)) : 0;
-  return (
-    <div className="progress">
-      <div className="progress-head">
-        <span className="spinner" aria-hidden="true" />
-        <span className="progress-stage mono">{progress.name}</span>
-      </div>
-      <div className="bar">
-        <div className="bar-fill" style={{ width: `${pct}%` }} />
-      </div>
-      <p className="progress-message">{progress.message}</p>
-      {log.length > 0 && (
-        <ul className="log">
-          {log.map((line, i) => (
-            <li key={i}>{line}</li>
-          ))}
-        </ul>
+      {task.status === "error" && (
+        <>
+          <p className="error-message dl-error">{task.errorMessage}</p>
+          {task.errorRaw && (
+            <details className="raw-error">
+              <summary>查看原始错误</summary>
+              <pre className="error-text">{task.errorRaw}</pre>
+            </details>
+          )}
+        </>
       )}
-    </div>
+
+      <div className="dl-actions">
+        {task.status === "error" && (
+          <button className="ghost" type="button" onClick={() => onRetry(task.id)}>
+            重试
+          </button>
+        )}
+        {task.status !== "running" && (
+          <button className="ghost danger" type="button" onClick={() => onRemove(task.id)}>
+            删除
+          </button>
+        )}
+      </div>
+    </li>
   );
+}
+
+function statusLabel(s: DownloadTask["status"]): string {
+  switch (s) {
+    case "queued":
+      return "排队中";
+    case "running":
+      return "下载中";
+    case "done":
+      return "已完成";
+    case "error":
+      return "失败";
+  }
 }
 
 /* ================= 设置抽屉（settings） ================= */
