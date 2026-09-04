@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- Transparent favicon: Zephyr monogram -->
+  <g>
+    <rect x="128" y="124" width="268" height="74" rx="37" fill="#0b1220"/>
+    <rect x="128" y="328" width="268" height="74" rx="37" fill="#0b1220"/>
+    <path d="M 396 161 L 128 355" stroke="#33d399" stroke-width="74" stroke-linecap="round" fill="none"/>
+  </g>
+</svg>
