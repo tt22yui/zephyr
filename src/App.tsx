@@ -17,6 +17,14 @@ interface ProgressPayload {
   message: string;
 }
 
+interface SearchResult {
+  name: string;
+  description: string;
+  stars: number;
+  is_official: boolean;
+  updated_at: string;
+}
+
 type ViewState =
   | { kind: "idle" }
   | { kind: "running"; progress: ProgressPayload; log: string[] }
@@ -34,6 +42,7 @@ const STORE = {
   arch: "dpt.arch",
   http: "dpt.http",
   history: "dpt.history",
+  search: "dpt.search",
 };
 
 function load<T>(key: string, fallback: T): T {
@@ -74,6 +83,11 @@ function App() {
   const [password, setPassword] = useState("");
   const [outFile, setOutFile] = useState("");
   const [history, setHistory] = useState<string[]>(() => load(STORE.history, []));
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searching, setSearching] = useState(false);
+  const [searchResults, setSearchResults] = useState<SearchResult[] | null>(null);
+  const [searchError, setSearchError] = useState("");
+  const [searchHistory, setSearchHistory] = useState<string[]>(() => load(STORE.search, []));
   const [busy, setBusy] = useState(false);
   const [view, setView] = useState<ViewState>({ kind: "idle" });
 
@@ -124,6 +138,42 @@ function App() {
     void runPull(image.trim());
   }
 
+  const searchImage = useCallback(
+    async (q: string) => {
+      const kw = q.trim();
+      if (!kw || busy) return;
+      setSearching(true);
+      setSearchError("");
+      setSearchResults(null);
+      try {
+        const results = await invoke<SearchResult[]>("search_image", { query: kw, pageSize: 25 });
+        setSearchResults(results);
+        if (results.length > 0) {
+          const next = [...searchHistory.filter((h) => h !== kw), kw].slice(-8);
+          setSearchHistory(next);
+          save(STORE.search, next);
+        }
+      } catch (err) {
+        setSearchError(friendlyError(String(err)));
+      } finally {
+        setSearching(false);
+      }
+    },
+    [busy, searchHistory],
+  );
+
+  function doSearch(e: React.FormEvent) {
+    e.preventDefault();
+    void searchImage(searchQuery);
+  }
+
+  function pickResult(name: string) {
+    setImage(name);
+    setSearchQuery("");
+    setSearchResults(null);
+    setSearchError("");
+  }
+
   async function copyCmd(path: string) {
     await navigator.clipboard.writeText(`docker load -i ${path}`);
   }
@@ -148,6 +198,56 @@ function App() {
 
       <div className="layout">
         <section className="panel form-panel" aria-label="拉取配置">
+          <div className="search" aria-label="镜像搜索">
+            <form className="search-bar" onSubmit={doSearch}>
+              <input
+                className="mono"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.currentTarget.value)}
+                list="search-history"
+                spellCheck={false}
+                placeholder="搜索 Docker Hub 镜像，如 nginx"
+              />
+              <datalist id="search-history">
+                {searchHistory.map((h) => <option key={h} value={h} />)}
+              </datalist>
+              <button className="ghost" type="submit" disabled={busy || searching || !searchQuery.trim()}>
+                {searching ? "搜索中…" : "搜索"}
+              </button>
+            </form>
+
+            {searching && (
+              <div className="search-status">
+                <span className="spinner" aria-hidden="true" />
+                搜索中…
+              </div>
+            )}
+            {!searching && searchError && <p className="search-error">{searchError}</p>}
+            {!searching && !searchError && searchResults !== null && (
+              searchResults.length === 0 ? (
+                <p className="search-empty">未找到相关镜像，换个关键词试试。</p>
+              ) : (
+                <ul className="search-results">
+                  {searchResults.map((r) => (
+                    <li key={r.name}>
+                      <button
+                        type="button"
+                        className="search-item"
+                        onClick={() => pickResult(r.name)}
+                        title={`填入 ${r.name}`}
+                      >
+                        <span className="search-item-name mono">{r.name}</span>
+                        {r.is_official && <span className="badge-official">官方</span>}
+                        <span className="search-item-stars">⭐ {r.stars}</span>
+                        <span className="search-item-desc">{r.description || "（无简介）"}</span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )
+            )}
+          </div>
+
           <form onSubmit={doPull}>
             <label className="field">
               <span className="field-label">镜像名称</span>
