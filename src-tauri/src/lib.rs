@@ -18,6 +18,26 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            // 启动时定位主窗口：默认居中；若窗口尺寸超过所在工作区则自动最大化。
+            // 这里统一比较物理像素，因此对 Windows 高 DPI 缩放（scale_factor > 1）
+            // 也能正确判定，无需在逻辑像素上额外换算。
+            if let Some(win) = app.get_webview_window("main") {
+                let too_big = match (win.current_monitor().ok().flatten(), win.outer_size()) {
+                    (Some(mon), Ok(size)) => {
+                        let wa = mon.work_area().size;
+                        size.width > wa.width || size.height > wa.height
+                    }
+                    _ => false,
+                };
+                if too_big {
+                    let _ = win.maximize();
+                } else {
+                    let _ = win.center();
+                }
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             pull::pull_image,
             search::search_image,

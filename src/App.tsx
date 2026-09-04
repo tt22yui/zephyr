@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -73,7 +73,12 @@ type PullView =
 type Stage =
   | { kind: "home" }
   | { kind: "results"; query: string; sourceUrl: string | null }
-  | { kind: "detail"; image: string }
+  | {
+      kind: "detail";
+      image: string;
+      /** 进入详情前所在的搜索结果上下文；为 null 表示直接从首页进来。 */
+      from: { query: string; sourceUrl: string | null } | null;
+    }
   | { kind: "pull"; image: string; view: PullView; arch: string };
 
 /* ================= 存储与工具 ================= */
@@ -281,6 +286,34 @@ function App() {
     save(STORE.search, next);
   }
 
+  /** 左上角返回：详情按来源回列表，其余回首页。 */
+  function goBack() {
+    if (stage.kind === "detail") {
+      setStage(
+        stage.from
+          ? { kind: "results", query: stage.from.query, sourceUrl: stage.from.sourceUrl }
+          : { kind: "home" },
+      );
+    } else {
+      setStage({ kind: "home" });
+    }
+  }
+
+  /** 顶栏左端标题，伴随返回箭头同行显示。 */
+  const pageTitle: ReactNode =
+    stage.kind === "results" ? (
+      <>
+        搜索 “<span className="mono">{stage.query}</span>”
+      </>
+    ) : stage.kind === "detail" ? (
+      <span className="mono">{stage.image}</span>
+    ) : stage.kind === "pull" ? (
+      <span className="mono">
+        {stage.image}
+        {stage.arch ? ` (${stage.arch})` : ""}
+      </span>
+    ) : null;
+
   return (
     <div className="app">
       <TopBar
@@ -292,6 +325,11 @@ function App() {
         setArch={setArch}
         registries={registries}
         onSettings={() => setSettingsOpen(true)}
+        canGoBack={stage.kind !== "home"}
+        onBack={goBack}
+        showHome={stage.kind === "detail"}
+        onGoHome={() => setStage({ kind: "home" })}
+        title={pageTitle}
       />
 
       <main className="layout">
@@ -301,7 +339,7 @@ function App() {
               const src = resolveSource(source, registries);
               if (src.host === HUB_HOST) {
                 if (looksLikeRef(query)) {
-                  setStage({ kind: "detail", image: query.trim() });
+                  setStage({ kind: "detail", image: query.trim(), from: null });
                 } else {
                   pushSearchHistory(query.trim());
                   setStage({ kind: "results", query: query.trim(), sourceUrl: null });
@@ -312,7 +350,7 @@ function App() {
               } else {
                 // 无搜索 API 的第三方库：把输入当作引用；缺主机前缀时补上该库主机。
                 const img = hasHostPrefix(query.trim()) ? query.trim() : `${src.host}/${query.trim()}`;
-                setStage({ kind: "detail", image: img });
+                setStage({ kind: "detail", image: img, from: null });
               }
             }}
           />
@@ -322,12 +360,17 @@ function App() {
           <ResultsView
             query={stage.query}
             sourceUrl={stage.sourceUrl}
-            onSelect={(name) => setStage({ kind: "detail", image: name })}
+            onSelect={(name) =>
+              setStage({
+                kind: "detail",
+                image: name,
+                from: { query: stage.query, sourceUrl: stage.sourceUrl },
+              })
+            }
             onPull={(name) => {
               pushHistory(name);
               void runPull(name, concreteArch(arch), false);
             }}
-            onBack={() => setStage({ kind: "home" })}
           />
         )}
 
@@ -340,17 +383,13 @@ function App() {
               pushHistory(img);
               void runPull(img, targetArch, useHttp);
             }}
-            onBack={() => setStage({ kind: "home" })}
           />
         )}
 
         {stage.kind === "pull" && (
           <PullView
-            image={stage.image}
             view={stage.view}
-            arch={stage.arch}
             onRetry={() => runPull(stage.image, stage.arch, false)}
-            onBack={() => setStage({ kind: "home" })}
           />
         )}
       </main>
@@ -380,11 +419,35 @@ interface TopBarProps {
   setArch: (a: Arch) => void;
   registries: RegistryCfg[];
   onSettings: () => void;
+  canGoBack: boolean;
+  onBack: () => void;
+  showHome: boolean;
+  onGoHome: () => void;
+  title: ReactNode;
 }
 
-function TopBar({ busy, pullMessage, source, setSource, arch, setArch, registries, onSettings }: TopBarProps) {
+function TopBar({ busy, pullMessage, source, setSource, arch, setArch, registries, onSettings, canGoBack, onBack, showHome, onGoHome, title }: TopBarProps) {
   return (
     <header className="topbar">
+      <div className="topbar-left">
+        {canGoBack && (
+          <button className="back-icon" type="button" onClick={onBack} title="返回" aria-label="返回">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="M19 12H5" />
+              <path d="m12 19-7-7 7-7" />
+            </svg>
+          </button>
+        )}
+        {showHome && (
+          <button className="top-home" type="button" onClick={onGoHome} title="回到主页" aria-label="回到主页">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+              <path d="M9 22V12h6v10" />
+            </svg>
+          </button>
+        )}
+        {title && <span className="topbar-title">{title}</span>}
+      </div>
       <div className="topbar-right">
         {busy && (
           <div className="busy">
@@ -482,10 +545,9 @@ interface ResultsProps {
   sourceUrl: string | null;
   onSelect: (name: string) => void;
   onPull: (name: string) => void;
-  onBack: () => void;
 }
 
-function ResultsView({ query, sourceUrl, onSelect, onPull, onBack }: ResultsProps) {
+function ResultsView({ query, sourceUrl, onSelect, onPull }: ResultsProps) {
   const [results, setResults] = useState<SearchResult[] | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
@@ -506,15 +568,6 @@ function ResultsView({ query, sourceUrl, onSelect, onPull, onBack }: ResultsProp
 
   return (
     <div className="result-page">
-      <div className="page-head">
-        <button className="ghost" type="button" onClick={onBack}>
-          ← 返回
-        </button>
-        <span className="page-title">
-          搜索 “<span className="mono">{query}</span>”
-        </span>
-      </div>
-
       {loading && (
         <div className="search-status">
           <span className="spinner" aria-hidden="true" />
@@ -524,21 +577,6 @@ function ResultsView({ query, sourceUrl, onSelect, onPull, onBack }: ResultsProp
       {!loading && error && <p className="search-error">{error}</p>}
       {!loading && !error && (
         <>
-          <div className="pin-card">
-            <div className="pin-main">
-              <span className="pin-badge">直接拉取</span>
-              <code className="mono pin-name">{query}</code>
-            </div>
-            <div className="pin-actions">
-              <button className="ghost" type="button" onClick={() => onPull(query)}>
-                直接下载
-              </button>
-              <button className="ghost" type="button" onClick={() => onSelect(query)}>
-                详情
-              </button>
-            </div>
-          </div>
-
           {results === null || results.length === 0 ? (
             <p className="search-empty">未找到相关镜像，换个关键词试试。</p>
           ) : (
@@ -558,8 +596,8 @@ function ResultsView({ query, sourceUrl, onSelect, onPull, onBack }: ResultsProp
                     {r.updated_at && <span className="result-updated">更新 {r.updated_at.slice(0, 10)}</span>}
                   </button>
                   <div className="result-actions">
-                    <button className="ghost" type="button" onClick={() => onPull(r.name)} title="用默认参数立即下载">
-                      直接下载
+                    <button className="ghost action" type="button" onClick={() => onPull(r.name)} title="用默认参数立即下载">
+                      下载
                     </button>
                     <button className="ghost" type="button" onClick={() => onSelect(r.name)}>
                       详情
@@ -582,10 +620,9 @@ interface DetailProps {
   defaultArch: Arch;
   account?: AccountCfg;
   onDownload: (img: string, arch: string, useHttp: boolean) => void;
-  onBack: () => void;
 }
 
-function DetailView({ image, defaultArch, account, onDownload, onBack }: DetailProps) {
+function DetailView({ image, defaultArch, account, onDownload }: DetailProps) {
   const [inspect, setInspect] = useState<InspectResult | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -627,13 +664,6 @@ function DetailView({ image, defaultArch, account, onDownload, onBack }: DetailP
 
   return (
     <div className="result-page">
-      <div className="page-head">
-        <button className="ghost" type="button" onClick={onBack}>
-          ← 返回
-        </button>
-        <span className="page-title mono">{image}</span>
-      </div>
-
       {loading && (
         <div className="search-status">
           <span className="spinner" aria-hidden="true" />
@@ -750,17 +780,13 @@ function DetailView({ image, defaultArch, account, onDownload, onBack }: DetailP
               <label className="toggle">
                 <input type="checkbox" checked={useHttp} onChange={(e) => setUseHttp(e.currentTarget.checked)} />
                 <span className="toggle-track" aria-hidden="true" />
-                <span className="toggle-label">使用 HTTP</span>
+                <span className="toggle-label">HTTP</span>
               </label>
+              <button className="primary" type="button" onClick={() => onDownload(image, arch, useHttp)}>
+                开始下载
+              </button>
             </div>
-            <button
-              className="primary"
-              type="button"
-              onClick={() => onDownload(image, arch, useHttp)}
-            >
-              开始下载
-            </button>
-            <p className="hint">输出目录可在「设置 → 下载目录」配置，默认保存到系统下载目录。</p>
+            <p className="hint">输出目录见「设置 → 下载目录」，默认保存到系统下载目录。</p>
           </section>
         </div>
       )}
@@ -788,28 +814,14 @@ function onSelectTag(
 }
 
 function PullView({
-  image,
   view,
-  arch,
   onRetry,
-  onBack,
 }: {
-  image: string;
   view: PullView;
-  arch: string;
   onRetry: () => void;
-  onBack: () => void;
 }) {
   return (
     <div className="rail-full">
-      <div className="page-head">
-        <button className="ghost" type="button" onClick={onBack}>
-          ← 返回
-        </button>
-        <span className="page-title mono">
-          {image} {arch ? `(${arch})` : ""}
-        </span>
-      </div>
       {view.kind === "running" && <ProgressView progress={view.progress} log={view.log} />}
       {view.kind === "error" && (
         <div className="state state-error">
