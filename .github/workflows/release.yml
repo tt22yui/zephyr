@@ -10,8 +10,8 @@ permissions:
   contents: write
 
 jobs:
-  # macOS 通用包（Intel + Apple Silicon）→ .dmg，由 tauri-action 创建草稿 Release 并上传
-  release-macos-dmg:
+  # macOS 通用包（Intel + Apple Silicon）→ .dmg
+  build-macos-dmg:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -39,20 +39,21 @@ jobs:
         with:
           workspaces: "./src-tauri -> target"
 
-      - name: Build and release DMG
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "泽帆 Zephyr ${{ github.ref_name }}"
-          releaseBody: "Windows 便携绿色版(.exe) 与 macOS(.dmg) 见本 Release 资产。"
-          releaseDraft: true
-          prerelease: false
-          args: "--bundles dmg --target universal-apple-darwin"
+      - name: Build DMG
+        run: npm run tauri -- build --bundles dmg --target universal-apple-darwin
 
-  # Windows 64 位便携绿色版 → 单个 zephyr.exe，无需安装
-  release-windows-portable:
+      - name: Normalize DMG name
+        run: |
+          find src-tauri/target/universal-apple-darwin/release/bundle/dmg -name '*.dmg' -exec mv {} zephyr-macos-universal.dmg \;
+
+      - name: Upload macOS DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zephyr-macos-universal
+          path: zephyr-macos-universal.dmg
+
+  # Windows 64 位便携绿色版 → 打包成 .zip
+  build-windows-portable:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -80,9 +81,44 @@ jobs:
       - name: Build portable exe (no bundle)
         run: npm run tauri -- build --no-bundle
 
-      - name: Upload portable exe
+      - name: Package portable zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path staging | Out-Null
+          Copy-Item src-tauri/target/release/zephyr.exe staging/zephyr.exe
+          Compress-Archive -Path staging/zephyr.exe -DestinationPath zephyr-windows-x86_64.zip -CompressionLevel Optimal
+
+      - name: Upload Windows portable zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zephyr-windows-portable
+          path: zephyr-windows-x86_64.zip
+
+  # 统一重命名并按 zephyr-<版本>-<平台>-<架构>.<后缀> 上传到 Release
+  release:
+    needs: [build-macos-dmg, build-windows-portable]
+    runs-on: ubuntu-latest
+    env:
+      REF_NAME: ${{ github.ref_name }}
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Normalize artifact names
+        run: |
+          cd dist
+          mv zephyr-windows-portable/zephyr-windows-x86_64.zip "${REF_NAME}-windows-x86_64.zip"
+          mv zephyr-macos-universal/zephyr-macos-universal.dmg "${REF_NAME}-macos-universal.dmg"
+          ls -la
+
+      - name: Publish Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
+          release_name: "泽帆 Zephyr ${{ github.ref_name }}"
+          body: "Windows 便携绿色版(.zip) 与 macOS(.dmg) 见本 Release 资产。"
           draft: true
-          files: src-tauri/target/release/zephyr.exe
+          files: "dist/*.zip"
+          files_append: "dist/*.dmg"
