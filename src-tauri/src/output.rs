@@ -64,6 +64,7 @@ fn add_symlink<W: Write>(
 async fn fetch_all_unique(
     client: &RegistryClient,
     digests: &[String],
+    cancel: &crate::cancel::CancelToken,
     progress: &(dyn Fn(&str, u64, u64) + Send + Sync),
 ) -> Result<HashMap<String, Vec<u8>>, String> {
     let mut seen: HashSet<String> = HashSet::new();
@@ -79,7 +80,7 @@ async fn fetch_all_unique(
         let client = client;
         let counter = Arc::clone(&counter);
         async move {
-            let bytes = client.fetch_blob(&d).await?;
+            let bytes = client.fetch_blob(&d, cancel).await?;
             let done = counter.fetch_add(1, Ordering::SeqCst) as u64 + 1;
             progress("blob", done, total);
             Ok::<(String, Vec<u8>), String>((d, bytes))
@@ -105,6 +106,7 @@ fn pack_tar(
     blob_digests: &[String],
     blobs: &HashMap<String, Vec<u8>>,
     tar_path: &Path,
+    cancel: &crate::cancel::CancelToken,
     progress: &(dyn Fn(&str, u64, u64) + Send + Sync),
 ) -> Result<(), String> {
     if blob_digests.len() < out.layers.len() {
@@ -126,6 +128,7 @@ fn pack_tar(
 
     // 逐层：json / VERSION / layer.tar。共享 blob 用软链复用首次出现的层。
     for (i, layer) in out.layers.iter().enumerate() {
+        crate::cancel::check(cancel)?;
         add_bytes(&mut builder, &format!("{}/json", layer.v1_id), &layer.json)?;
         add_bytes(&mut builder, &format!("{}/VERSION", layer.v1_id), b"1.0")?;
 
@@ -175,6 +178,7 @@ pub async fn write_tar(
     config_bytes: &[u8],
     blob_digests: &[String],
     tar_path: &Path,
+    cancel: &crate::cancel::CancelToken,
     progress: &(dyn Fn(&str, u64, u64) + Send + Sync),
 ) -> Result<(), String> {
     if blob_digests.len() < out.layers.len() {
@@ -184,8 +188,27 @@ pub async fn write_tar(
     let total_blobs = blob_digests.iter().filter(|d| !d.is_empty()).count() as u64;
     progress("download", 0, total_blobs);
     // 先并发把所有（去重后的）blob 拉进内存。
-    let blobs = fetch_all_unique(client, blob_digests, progress).await?;
-    pack_tar(out, config_digest, config_bytes, blob_digests, &blobs, tar_path, progress)
+    let blobs = fetch_all_unique(client, blob_digests, cancel, progress).await;
+
+    let result = match blobs {
+        Ok(map) => pack_tar(
+            out,
+            config_digest,
+            config_bytes,
+            blob_digests,
+            &map,
+            tar_path,
+            cancel,
+            progress,
+        ),
+        Err(e) => Err(e),
+    };
+
+    // 出错（含用户停止）时删除可能已写了一半的 tar，避免留下残留文件。
+    if result.is_err() {
+        let _ = std::fs::remove_file(tar_path);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -233,6 +256,7 @@ mod tests {
         let blobs = StdHashMap::from([("sha256:x".to_string(), b"LAYERDATA".to_vec())]);
         let path = temp_path();
         let progress = |_: &str, _: u64, _: u64| {};
+        let cancel = crate::cancel::register("pack_full");
 
         pack_tar(
             &out,
@@ -241,9 +265,11 @@ mod tests {
             &["sha256:x".to_string(), "sha256:x".to_string()],
             &blobs,
             &path,
+            &cancel,
             &progress,
         )
         .unwrap();
+        crate::cancel::unregister("pack_full");
 
         let file = File::open(&path).unwrap();
         let mut ar = tar::Archive::new(file);
@@ -291,6 +317,7 @@ mod tests {
         let blobs = StdHashMap::new();
         let path = temp_path();
         let progress = |_: &str, _: u64, _: u64| {};
+        let cancel = crate::cancel::register("pack_miss");
         let err = pack_tar(
             &out,
             "sha256:cfg",
@@ -298,9 +325,11 @@ mod tests {
             &["sha256:x".to_string(), "sha256:x".to_string()],
             &blobs,
             &path,
+            &cancel,
             &progress,
         )
         .unwrap_err();
+        crate::cancel::unregister("pack_miss");
         assert!(err.contains("sha256:x"), "缺失 blob 应指出问题 digest: {err}");
     }
 

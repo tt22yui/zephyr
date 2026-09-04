@@ -338,7 +338,14 @@ impl RegistryClient {
     }
 
     /// 拉取 config blob 原始字节（与 digest 对应）。
-    pub async fn fetch_blob(&self, digest: &str) -> Result<Vec<u8>, String> {
+    ///
+    /// 采用流式读取以便在下载过程中响应「停止」：每读到一个 chunk 前检查一次
+    /// `cancel` 令牌，命中即以「已停止」错误终止，避免继续下载大 blob。
+    pub async fn fetch_blob(
+        &self,
+        digest: &str,
+        cancel: &crate::cancel::CancelToken,
+    ) -> Result<Vec<u8>, String> {
         let url = format!(
             "{}/v2/{}/blobs/{}",
             self.endpoint(),
@@ -349,13 +356,22 @@ impl RegistryClient {
         if !self.token.is_empty() {
             req = req.bearer_auth(&self.token);
         }
-        let resp = req.send().await.map_err(|e| format!("请求 blob 失败: {e}"))?;
+        let mut resp = req.send().await.map_err(|e| format!("请求 blob 失败: {e}"))?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(format!("抓取 blob {digest} 失败: {status}: {body}"));
         }
-        resp.bytes().await.map(|b| b.to_vec()).map_err(|e| format!("读取 blob 失败: {e}"))
+        crate::cancel::check(cancel)?;
+        let mut bytes = Vec::with_capacity(resp.content_length().unwrap_or(0) as usize);
+        loop {
+            crate::cancel::check(cancel)?;
+            match resp.chunk().await.map_err(|e| format!("读取 blob 失败: {e}"))? {
+                Some(chunk) => bytes.extend_from_slice(&chunk),
+                None => break,
+            }
+        }
+        Ok(bytes)
     }
 
     pub fn arch(&self) -> &str {

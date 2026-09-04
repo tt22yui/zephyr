@@ -3,6 +3,7 @@
 use tauri::Manager;
 
 pub mod auth;
+pub mod cancel;
 pub mod collect;
 pub mod config;
 pub mod endpoint;
@@ -40,6 +41,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             pull::pull_image,
+            pull::stop_image,
             search::search_image,
             inspect::inspect_image,
             get_download_dir

@@ -619,16 +619,16 @@ select {
 }
 
 /* ===== 详情 ===== */
-.detail { display: flex; flex-direction: column; gap: var(--sp-4); }
+.detail { display: flex; flex-direction: column; gap: var(--sp-2); }
 .panel-detail {
   background: var(--surface-1);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
-  padding: var(--sp-3);
+  padding: var(--sp-2);
 }
 .detail-h2 {
-  margin: 0 0 var(--sp-2);
-  font-size: 12px;
+  margin: 0 0 6px;
+  font-size: 11px;
   font-weight: 700;
   color: var(--text-secondary);
   text-transform: uppercase;
@@ -643,7 +643,7 @@ select {
   background: var(--surface-0);
 }
 .kv dt {
-  padding: 8px var(--sp-2);
+  padding: 5px var(--sp-2);
   background: var(--surface-1);
   font-size: 11px;
   text-transform: uppercase;
@@ -653,7 +653,7 @@ select {
 .kv dt:not(:first-child) { border-top: 1px solid var(--border-subtle); }
 .kv dd {
   margin: 0;
-  padding: 8px var(--sp-2);
+  padding: 5px var(--sp-2);
   font-size: 12px;
   word-break: break-all;
 }
@@ -662,7 +662,7 @@ select {
 .detail-config summary { cursor: pointer; list-style: none; padding: 0; }
 .detail-config summary::-webkit-details-marker { display: none; }
 .detail-config[open] { padding-bottom: 0; }
-.cfg-line { margin: 6px 0; font-size: 12px; display: flex; gap: 8px; align-items: baseline; }
+.cfg-line { margin: 4px 0; font-size: 12px; display: flex; gap: 8px; align-items: baseline; }
 .cfg-line .cfg-key {
   font-size: 10px;
   font-weight: 700;
@@ -841,6 +841,7 @@ select {
 @keyframes slideIn { from { transform: translateX(20px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
 
 .drawer-head { display: flex; align-items: center; justify-content: space-between; }
+.drawer-actions { display: flex; align-items: center; gap: 8px; }
 .drawer-title { margin: 0; font-size: 16px; font-weight: 700; }
 
 .settings-sec { display: flex; flex-direction: column; gap: var(--sp-2); }
@@ -874,14 +875,6 @@ select {
 .settings-form.dir-form .grow { flex: 1; }
 
 /* ===== 下载列表抽屉（downloads） ===== */
-.dl-controls {
-  display: flex;
-  align-items: flex-end;
-  gap: var(--sp-2);
-}
-.dl-controls .field.grow { flex: 1; }
-.dl-controls .field select { width: 100%; }
-
 .dl-list {
   margin: 0;
   padding: 0;
@@ -914,10 +907,6 @@ select {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.dl-arch { margin: 0; font-size: 11px; color: var(--text-tertiary); }
-.dl-message { margin: 0; font-size: 12px; color: var(--text-secondary); }
-.dl-bar { margin-top: 2px; }
-
 .dl-status {
   flex: none;
   font-size: 11px;
@@ -929,32 +918,19 @@ select {
 .dl-status-running { color: var(--accent); background: var(--accent-soft); }
 .dl-status-done { color: var(--text-primary); background: var(--surface-0); }
 .dl-status-error { color: var(--danger); background: var(--danger-soft); }
+.dl-status-stopped { color: var(--text-tertiary); background: var(--surface-0); }
 
-.dl-result {
+.dl-head-right { display: flex; align-items: center; gap: 6px; flex: none; }
+.dl-stop { padding: 2px 10px; font-size: 11px; }
+
+.dl-bar {
   display: flex;
   align-items: center;
-  gap: var(--sp-2);
-  min-width: 0;
-}
-.dl-path {
-  font-size: 11px;
-  color: var(--text-secondary);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.dl-result .ghost.copy { flex: none; margin-left: auto; }
-.dl-error { margin-bottom: 0; }
-.dl-log { max-height: 160px; font-size: 11px; }
-
-.dl-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 6px;
-  border-top: 1px solid var(--border-subtle);
-  padding-top: 8px;
+  gap: 8px;
   margin-top: 2px;
 }
+.dl-bar .bar.grow { flex: 1; }
+.dl-pct { margin: 0; font-size: 11px; color: var(--text-tertiary); flex: none; min-width: 34px; text-align: right; }
 
 /* ===== 响应式 ===== */
 @media (max-width: 640px) {

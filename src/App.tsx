@@ -72,7 +72,7 @@ interface DownloadTask {
   image: string;
   arch: string;
   useHttp: boolean;
-  status: "queued" | "running" | "done" | "error";
+  status: "queued" | "running" | "done" | "error" | "stopped";
   /** 最近一次收到的进度（running 时持续更新）。 */
   progress: ProgressPayload | null;
   log: string[];
@@ -306,15 +306,25 @@ function App() {
       outDir: downloadDir || null,
     })
       .then((r) => {
-        patchTasks((prev) => prev.map((t) => (t.id === id ? { ...t, status: "done", result: r } : t)));
+        // 任务已被用户停止时不覆盖为「完成」（即使文件已落盘）。
+        patchTasks((prev) =>
+          prev.map((t) =>
+            t.id === id && t.status !== "stopped" ? { ...t, status: "done", result: r } : t,
+          ),
+        );
         kick();
       })
       .catch((err) => {
         const raw = String(err);
         patchTasks((prev) =>
-          prev.map((t) =>
-            t.id === id ? { ...t, status: "error", errorRaw: raw, errorMessage: friendlyError(raw) } : t,
-          ),
+          prev.map((t) => {
+            if (t.id !== id) return t;
+            // 主动停止后，取消错误归为「已停止」而非普通失败。
+            const cancelled = t.status === "stopped" || raw.includes("停止");
+            return cancelled
+              ? { ...t, status: "stopped", progress: null, log: [], errorRaw: undefined, errorMessage: undefined }
+              : { ...t, status: "error", errorRaw: raw, errorMessage: friendlyError(raw) };
+          }),
         );
         kick();
       });
@@ -346,36 +356,22 @@ function App() {
     kick();
   };
 
-  /** 失败任务重试：重置为排队状态并重新调度。 */
-  const retryTask = (id: string) => {
-    patchTasks((prev) =>
-      prev.map((t) =>
-        t.id === id && t.status === "error"
-          ? {
-              ...t,
-              status: "queued",
-              progress: null,
-              log: [],
-              result: undefined,
-              errorRaw: undefined,
-              errorMessage: undefined,
-            }
-          : t,
-      ),
-    );
-    kick();
-  };
-
-  /** 删除单个任务（运行中的不允许删除）。 */
-  const removeTask = (id: string) => {
-    const task = tasksRef.current.find((t) => t.id === id);
-    if (!task || task.status === "running") return;
-    patchTasks((prev) => prev.filter((t) => t.id !== id));
-  };
-
   /** 清空所有已完成/失败任务。 */
   const clearDone = () => {
     patchTasks((prev) => prev.filter((t) => t.status === "queued" || t.status === "running"));
+  };
+
+  /** 停止单个任务：排队中直接标记停止；运行中同时通知后端中止下载。 */
+  const stopTask = (id: string) => {
+    const t = tasksRef.current.find((x) => x.id === id);
+    if (!t) return;
+    patchTasks((prev) =>
+      prev.map((x) => (x.id === id ? { ...x, status: "stopped" as const, progress: null } : x)),
+    );
+    if (t.status === "running") {
+      void invoke("stop_image", { taskId: id }).catch(() => {});
+    }
+    kick();
   };
 
   function pushHistory(img: string) {
@@ -493,16 +489,15 @@ function App() {
         setAccounts={setAccounts}
         downloadDir={downloadDir}
         setDownloadDir={setDownloadDir}
+        concurrency={concurrency}
+        setConcurrency={setConcurrency}
       />
 
       <DownloadsDrawer
         open={downloadsOpen}
         onClose={() => setDownloadsOpen(false)}
         tasks={tasks}
-        concurrency={concurrency}
-        setConcurrency={setConcurrency}
-        onRetry={retryTask}
-        onRemove={removeTask}
+        onStop={stopTask}
         onClearDone={clearDone}
       />
     </div>
@@ -923,51 +918,33 @@ interface DownloadsProps {
   open: boolean;
   onClose: () => void;
   tasks: DownloadTask[];
-  concurrency: number;
-  setConcurrency: (n: number) => void;
-  onRetry: (id: string) => void;
-  onRemove: (id: string) => void;
+  onStop: (id: string) => void;
   onClearDone: () => void;
 }
 
-function DownloadsDrawer({ open, onClose, tasks, concurrency, setConcurrency, onRetry, onRemove, onClearDone }: DownloadsProps) {
+function DownloadsDrawer({ open, onClose, tasks, onStop, onClearDone }: DownloadsProps) {
   if (!open) return null;
   const active = tasks.filter((t) => t.status === "queued" || t.status === "running").length;
-  const finished = tasks.filter((t) => t.status === "done" || t.status === "error").length;
+  const finished = tasks.filter((t) => t.status === "done" || t.status === "error" || t.status === "stopped").length;
   return (
     <div className="drawer-mask" onClick={onClose}>
       <aside className="drawer" onClick={(e) => e.stopPropagation()} aria-label="下载列表">
         <div className="drawer-head">
           <h2 className="drawer-title">下载列表</h2>
-          <button className="ghost" type="button" onClick={onClose}>
-            关闭
-          </button>
+          <div className="drawer-actions">
+            <button className="ghost" type="button" onClick={onClearDone} disabled={finished === 0} title="清除已完成、失败与已停止任务">
+              清空已完成
+            </button>
+            <button className="ghost" type="button" onClick={onClose}>
+              关闭
+            </button>
+          </div>
         </div>
 
         <section className="settings-sec">
-          <div className="dl-controls">
-            <label className="field grow">
-              <span className="field-label">最大并发</span>
-              <select
-                className="mono"
-                value={concurrency}
-                onChange={(e) => setConcurrency(Number(e.currentTarget.value))}
-                aria-label="最大并发数"
-              >
-                {[1, 2, 3, 4, 5].map((n) => (
-                  <option key={n} value={n}>
-                    {n}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <button className="ghost" type="button" onClick={onClearDone} disabled={finished === 0} title="清除已完成与失败任务">
-              清空已完成
-            </button>
-          </div>
           <p className="settings-hint">
             {active > 0
-              ? `进行中 ${active} 个任务（含排队），完成后可在此复制导入命令。`
+              ? `进行中 ${active} 个任务（含排队）。`
               : finished > 0
                 ? `${finished} 个任务已结束。`
                 : "暂无下载任务。"}
@@ -979,7 +956,7 @@ function DownloadsDrawer({ open, onClose, tasks, concurrency, setConcurrency, on
         ) : (
           <ul className="dl-list">
             {tasks.map((t) => (
-              <TaskItem key={t.id} task={t} onRetry={onRetry} onRemove={onRemove} />
+              <TaskItem key={t.id} task={t} onStop={onStop} />
             ))}
           </ul>
         )}
@@ -989,15 +966,7 @@ function DownloadsDrawer({ open, onClose, tasks, concurrency, setConcurrency, on
 }
 
 /** 下载列表中的单个任务卡片。 */
-function TaskItem({
-  task,
-  onRetry,
-  onRemove,
-}: {
-  task: DownloadTask;
-  onRetry: (id: string) => void;
-  onRemove: (id: string) => void;
-}) {
+function TaskItem({ task, onStop }: { task: DownloadTask; onStop: (id: string) => void }) {
   const pct =
     task.progress && task.progress.total > 0
       ? Math.min(100, Math.round((task.progress.done / task.progress.total) * 100))
@@ -1008,70 +977,23 @@ function TaskItem({
         <span className="dl-name mono" title={task.image}>
           {task.image}
         </span>
-        <span className={`dl-status dl-status-${task.status}`}>{statusLabel(task.status)}</span>
+        <span className="dl-head-right">
+          {(task.status === "queued" || task.status === "running") && (
+            <button className="ghost dl-stop" type="button" onClick={() => onStop(task.id)}>
+              停止
+            </button>
+          )}
+          <span className={`dl-status dl-status-${task.status}`}>{statusLabel(task.status)}</span>
+        </span>
       </div>
-      <p className="dl-arch mono">{task.arch}</p>
-
-      {task.status === "running" && task.progress && (
-        <>
-          <div className="bar dl-bar">
+      {task.status === "running" && task.progress && task.progress.total > 0 && (
+        <div className="dl-bar">
+          <div className="bar grow">
             <div className="bar-fill" style={{ width: `${pct}%` }} />
           </div>
-          <p className="dl-message">{task.progress.message}</p>
-          {task.log.length > 0 && (
-            <details className="raw-error">
-              <summary>查看日志</summary>
-              <ul className="log dl-log">
-                {task.log.map((line, i) => (
-                  <li key={i}>{line}</li>
-                ))}
-              </ul>
-            </details>
-          )}
-        </>
-      )}
-
-      {task.status === "done" && task.result && (
-        <div className="dl-result">
-          <code className="mono dl-path" title={task.result.tar_path}>
-            {task.result.tar_path}
-          </code>
-          <button
-            className="ghost copy"
-            type="button"
-            onClick={() => {
-              void navigator.clipboard.writeText(`docker load -i ${task.result!.tar_path}`);
-            }}
-          >
-            复制命令
-          </button>
+          <span className="dl-pct mono">{pct}%</span>
         </div>
       )}
-
-      {task.status === "error" && (
-        <>
-          <p className="error-message dl-error">{task.errorMessage}</p>
-          {task.errorRaw && (
-            <details className="raw-error">
-              <summary>查看原始错误</summary>
-              <pre className="error-text">{task.errorRaw}</pre>
-            </details>
-          )}
-        </>
-      )}
-
-      <div className="dl-actions">
-        {task.status === "error" && (
-          <button className="ghost" type="button" onClick={() => onRetry(task.id)}>
-            重试
-          </button>
-        )}
-        {task.status !== "running" && (
-          <button className="ghost danger" type="button" onClick={() => onRemove(task.id)}>
-            删除
-          </button>
-        )}
-      </div>
     </li>
   );
 }
@@ -1086,6 +1008,8 @@ function statusLabel(s: DownloadTask["status"]): string {
       return "已完成";
     case "error":
       return "失败";
+    case "stopped":
+      return "已停止";
   }
 }
 
@@ -1100,9 +1024,11 @@ interface SettingsProps {
   setAccounts: (a: AccountCfg[]) => void;
   downloadDir: string;
   setDownloadDir: (d: string) => void;
+  concurrency: number;
+  setConcurrency: (n: number) => void;
 }
 
-function SettingsDrawer({ open, onClose, registries, setRegistries, accounts, setAccounts, downloadDir, setDownloadDir }: SettingsProps) {
+function SettingsDrawer({ open, onClose, registries, setRegistries, accounts, setAccounts, downloadDir, setDownloadDir, concurrency, setConcurrency }: SettingsProps) {
   const [newReg, setNewReg] = useState({ name: "", host: "", searchUrl: "" });
   const [newAcc, setNewAcc] = useState({ registry: "", username: "", password: "" });
 
@@ -1161,6 +1087,26 @@ function SettingsDrawer({ open, onClose, registries, setRegistries, accounts, se
               选择目录…
             </button>
           </div>
+        </section>
+
+        <section className="settings-sec">
+          <h3 className="settings-h3">最大并发</h3>
+          <p className="settings-hint">同时下载的镜像层数量。调高可加快大镜像的整体拉取，但会占用更多带宽与磁盘 IO。</p>
+          <label className="field">
+            <span className="field-label">最大并发数</span>
+            <select
+              className="mono"
+              value={concurrency}
+              onChange={(e) => setConcurrency(Number(e.currentTarget.value))}
+              aria-label="最大并发数"
+            >
+              {[1, 2, 3, 4, 5, 8].map((n) => (
+                <option key={n} value={n}>
+                  {n}
+                </option>
+              ))}
+            </select>
+          </label>
         </section>
 
         <section className="settings-sec">

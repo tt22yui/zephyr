@@ -79,9 +79,11 @@ pub async fn pull(
     use_http: bool,
     username: Option<String>,
     password: Option<String>,
+    cancel: &crate::cancel::CancelToken,
     progress: &(dyn Fn(&str, u64, u64) + Send + Sync),
 ) -> Result<PullResult, String> {
     // 1) 解析镜像引用
+    crate::cancel::check(cancel)?;
     let image_ref = endpoint::parse(image)?;
     let display = image_ref.display_name();
 
@@ -97,14 +99,16 @@ pub async fn pull(
     progress("auth", 1, 1);
 
     // 3) 索引/manifest
+    crate::cancel::check(cancel)?;
     progress("manifest", 0, 1);
     let meta = client.fetch_selected_manifest().await?;
     progress("manifest", 1, 1);
 
     // 4) config blob → DiffIDs
+    crate::cancel::check(cancel)?;
     progress("config", 0, 1);
     let config_digest = meta.config.digest.clone();
-    let config_bytes = client.fetch_blob(&config_digest).await?;
+    let config_bytes = client.fetch_blob(&config_digest, cancel).await?;
     let config_text = String::from_utf8_lossy(&config_bytes);
     let cfg = config::OciConfig::from_json(&config_text)?;
     let diff_ids = cfg.diff_ids().to_vec();
@@ -129,6 +133,7 @@ pub async fn pull(
     let collected = collect::collect(&image_ref, &diff_ids, &blob_digests, &config_digest, &cfg)?;
 
     // 7) 并发下载 + 打包
+    crate::cancel::check(cancel)?;
     let tar_path = match (out_file, out_dir) {
         (Some(p), _) => PathBuf::from(p),
         (None, Some(dir)) => PathBuf::from(dir).join(default_out_file(&image_ref)),
@@ -141,6 +146,7 @@ pub async fn pull(
         &config_bytes,
         &blob_digests,
         &tar_path,
+        cancel,
         progress,
     )
     .await?;
@@ -171,29 +177,44 @@ pub async fn pull_image(
     let arch = arch.unwrap_or_else(|| "amd64".to_string());
     let use_http = use_http.unwrap_or(false);
 
-    let app2 = app.clone();
-    let progress = move |name: &str, done: u64, total: u64| {
-        let payload = ProgressPayload {
-            task_id: task_id.clone(),
-            name: name.to_string(),
-            done,
-            total,
-            message: progress_message(name, done, total),
+    // 注册本任务的取消令牌；结束后（无论成败）立即移除，避免注册表膨胀。
+    let cancel = crate::cancel::register(&task_id);
+    let result = {
+        let app2 = app.clone();
+        let tid = task_id.clone();
+        let progress = move |name: &str, done: u64, total: u64| {
+            let payload = ProgressPayload {
+                task_id: tid.clone(),
+                name: name.to_string(),
+                done,
+                total,
+                message: progress_message(name, done, total),
+            };
+            let _ = app2.emit(PROGRESS_EVENT, payload);
         };
-        let _ = app2.emit(PROGRESS_EVENT, payload);
-    };
 
-    pull(
-        &image,
-        out_file,
-        out_dir,
-        arch,
-        use_http,
-        username,
-        password,
-        &progress,
-    )
-    .await
+        pull(
+            &image,
+            out_file,
+            out_dir,
+            arch,
+            use_http,
+            username,
+            password,
+            &cancel,
+            &progress,
+        )
+        .await
+    };
+    crate::cancel::unregister(&task_id);
+    result
+}
+
+/// 停止指定下载任务：命中已是取消状态返回 true，否则 false。
+/// 由前端在用户点击「停止」时调用；运行中的拉取会在下一个检查点终止。
+#[tauri::command]
+pub fn stop_image(task_id: String) -> bool {
+    crate::cancel::stop(&task_id)
 }
 
 #[cfg(test)]

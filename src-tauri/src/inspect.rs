@@ -140,10 +140,12 @@ pub async fn inspect(
     let meta = client.fetch_single_manifest(reference).await?;
 
     // config blob → InspectConfig（失败时降级为 None，不阻断详情展示）。
+    // inspect 为只读快查，无取消需求，传一个不会置位的局部令牌。
     let config = if meta.config.digest.is_empty() {
         None
     } else {
-        match client.fetch_blob(&meta.config.digest).await {
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        match client.fetch_blob(&meta.config.digest, &cancel).await {
             Ok(bytes) => {
                 let text = String::from_utf8_lossy(&bytes);
                 OciConfig::from_json(&text).ok().map(|c| config_to_inspect(&c))
