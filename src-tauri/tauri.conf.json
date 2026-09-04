@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "泽帆 Zephyr — 镜像拉取",
+        "title": "泽帆 Zephyr 0.1.0 — 镜像拉取",
         "width": 800,
         "height": 600
       }
