@@ -95,28 +95,21 @@ async fn fetch_all_unique(
     Ok(map)
 }
 
-/// 把所有文件打进 `tar_path`。
+/// 把已下载到内存的 blob 与收集结果打成 docker load 兼容的 tar。
 ///
-/// - `blob_digests`：与 `CollectOutput.layers` 同序的各层 blob 摘要。
-/// - `config_bytes`：config blob 原始字节（写入 `<configDigest>.json`）。
-/// - `progress(name, done, total)`：各阶段进度回调（"download" 开始时 / "blob" 逐块 / "write" 打包）。
-pub async fn write_tar(
-    client: &RegistryClient,
+/// 与网络下载解耦，便于无网络地单测真实 tar 布局（含共享 blob 的软链复用）。
+fn pack_tar(
     out: &CollectOutput,
     config_digest: &str,
     config_bytes: &[u8],
     blob_digests: &[String],
+    blobs: &HashMap<String, Vec<u8>>,
     tar_path: &Path,
     progress: &(dyn Fn(&str, u64, u64) + Send + Sync),
 ) -> Result<(), String> {
     if blob_digests.len() < out.layers.len() {
         return Err("blob digest 数少于层数".to_string());
     }
-
-    let total_blobs = blob_digests.iter().filter(|d| !d.is_empty()).count() as u64;
-    progress("download", 0, total_blobs);
-    // 先并发把所有（去重后的）blob 拉进内存。
-    let blobs = fetch_all_unique(client, blob_digests, progress).await?;
 
     progress("write", 0, 1);
     let file = File::create(tar_path).map_err(|e| format!("创建 tar 失败: {e}"))?;
@@ -170,35 +163,145 @@ pub async fn write_tar(
     Ok(())
 }
 
+/// 下载各层 blob 并打成 tar。
+///
+/// - `blob_digests`：与 `CollectOutput.layers` 同序的各层 blob 摘要。
+/// - `config_bytes`：config blob 原始字节（写入 `<configDigest>.json`）。
+/// - `progress(name, done, total)`：各阶段进度回调（"download" 开始时 / "blob" 逐块 / "write" 打包）。
+pub async fn write_tar(
+    client: &RegistryClient,
+    out: &CollectOutput,
+    config_digest: &str,
+    config_bytes: &[u8],
+    blob_digests: &[String],
+    tar_path: &Path,
+    progress: &(dyn Fn(&str, u64, u64) + Send + Sync),
+) -> Result<(), String> {
+    if blob_digests.len() < out.layers.len() {
+        return Err("blob digest 数少于层数".to_string());
+    }
+
+    let total_blobs = blob_digests.iter().filter(|d| !d.is_empty()).count() as u64;
+    progress("download", 0, total_blobs);
+    // 先并发把所有（去重后的）blob 拉进内存。
+    let blobs = fetch_all_unique(client, blob_digests, progress).await?;
+    pack_tar(out, config_digest, config_bytes, blob_digests, &blobs, tar_path, progress)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::collect::{CollectOutput, LayerInfo};
     use std::collections::BTreeMap;
+    use std::io::Read;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{collections::HashMap as StdHashMap, fs, path::PathBuf as StdPathBuf};
 
-    #[test]
-    fn symlink_target_for_shared_blob() {
-        let out = CollectOutput {
+    fn temp_path() -> StdPathBuf {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, AtomicOrdering::SeqCst);
+        std::env::temp_dir().join(format!("zephyr_pack_{nanos}_{n}.tar"))
+    }
+
+    fn sample_output() -> CollectOutput {
+        CollectOutput {
             layers: vec![
                 LayerInfo {
                     v1_id: "v1A".into(),
                     parent: String::new(),
-                    json: b"{}".to_vec(),
+                    json: br#"{"id":"v1A"}"#.to_vec(),
                 },
                 LayerInfo {
                     v1_id: "v1B".into(),
                     parent: "v1A".into(),
-                    json: b"{}".to_vec(),
+                    json: br#"{"id":"v1B"}"#.to_vec(),
                 },
             ],
             top_id: "v1B".into(),
-            manifest_json: b"[]".to_vec(),
-            repositories_json: b"{}".to_vec(),
+            manifest_json: br#"[]"#.to_vec(),
+            repositories_json: br#"{}"#.to_vec(),
             empty_layer_blob_sums: vec!["sha256:x".into()],
             blob_sum_v1: BTreeMap::from([("sha256:x".into(), vec!["v1A".into(), "v1B".into()])]),
-        };
-        assert_eq!(out.blob_sum_v1.get("sha256:x").unwrap()[1], "v1B");
-        assert_ne!(out.blob_sum_v1.get("sha256:x").unwrap()[0], "v1B");
+        }
+    }
+
+    #[test]
+    fn pack_tar_writes_full_layout_and_reuses_shared_blob() {
+        let out = sample_output();
+        let blobs = StdHashMap::from([("sha256:x".to_string(), b"LAYERDATA".to_vec())]);
+        let path = temp_path();
+        let progress = |_: &str, _: u64, _: u64| {};
+
+        pack_tar(
+            &out,
+            "sha256:cfg",
+            b"CONFIGBYTES",
+            &["sha256:x".to_string(), "sha256:x".to_string()],
+            &blobs,
+            &path,
+            &progress,
+        )
+        .unwrap();
+
+        let file = File::open(&path).unwrap();
+        let mut ar = tar::Archive::new(file);
+        let mut regular: StdHashMap<String, Vec<u8>> = StdHashMap::new();
+        let mut links: Vec<(String, String)> = Vec::new();
+
+        for entry in ar.entries().unwrap().flatten() {
+            let name = entry.path().unwrap().to_string_lossy().into_owned();
+            if entry.header().entry_type() == tar::EntryType::Symlink {
+                let target = entry
+                    .link_name()
+                    .unwrap()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                links.push((name, target));
+            } else {
+                let mut buf = Vec::new();
+                let mut e = entry;
+                e.read_to_end(&mut buf).unwrap();
+                regular.insert(name, buf);
+            }
+        }
+
+        fs::remove_file(&path).ok();
+
+        // 顶层索引文件
+        assert_eq!(regular.get("manifest.json").unwrap(), b"[]");
+        assert_eq!(regular.get("repositories").unwrap(), b"{}");
+        assert_eq!(regular.get("sha256:cfg.json").unwrap(), b"CONFIGBYTES");
+        // 每层的 json / VERSION
+        assert_eq!(regular.get("v1A/json").unwrap(), br#"{"id":"v1A"}"#);
+        assert_eq!(regular.get("v1B/json").unwrap(), br#"{"id":"v1B"}"#);
+        assert_eq!(regular.get("v1A/VERSION").unwrap(), b"1.0");
+        assert_eq!(regular.get("v1B/VERSION").unwrap(), b"1.0");
+        // 首个出现的层写真实 layer.tar
+        assert_eq!(regular.get("v1A/layer.tar").unwrap(), b"LAYERDATA");
+        assert!(!regular.contains_key("v1B/layer.tar"));
+        // 共享 blob 的第二层用软链指向 ../<首层ID>/layer.tar
+        assert!(links.contains(&("v1B/layer.tar".to_string(), "../v1A/layer.tar".to_string())));
+    }
+
+    #[test]
+    fn pack_tar_missing_blob_errors() {
+        let out = sample_output();
+        let blobs = StdHashMap::new();
+        let path = temp_path();
+        let progress = |_: &str, _: u64, _: u64| {};
+        let err = pack_tar(
+            &out,
+            "sha256:cfg",
+            b"cfg",
+            &["sha256:x".to_string(), "sha256:x".to_string()],
+            &blobs,
+            &path,
+            &progress,
+        )
+        .unwrap_err();
+        assert!(err.contains("sha256:x"), "缺失 blob 应指出问题 digest: {err}");
     }
 
     #[test]

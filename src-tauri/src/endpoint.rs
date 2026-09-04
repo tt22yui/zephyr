@@ -254,4 +254,66 @@ mod tests {
         assert!(parse("nginx@").is_err());
         assert!(parse("nginx:x y").is_err());
     }
+
+    #[test]
+    fn parse_host_normalization_is_case_insensitive() {
+        // docker.io 的大小写别名都应归一化到 API 主机。
+        let r = parse("DOCKER.IO/motrixapp/motrix-server:latest").unwrap();
+        assert_eq!(r.registry, "registry-1.docker.io");
+        assert_eq!(r.repo_path, "motrixapp/motrix-server");
+        let upper = parse("INDEX.DOCKER.IO/library/nginx").unwrap();
+        assert_eq!(upper.registry, "registry-1.docker.io");
+    }
+
+    #[test]
+    fn parse_localhost_without_port_is_host() {
+        let r = parse("localhost/foo/bar:1").unwrap();
+        assert_eq!(r.registry, "localhost");
+        assert_eq!(r.repo_path, "foo/bar");
+        assert_eq!(r.tag, "1");
+    }
+
+    #[test]
+    fn parse_registry_port_plus_digest() {
+        let r = parse("localhost:5000/img@sha256:abc").unwrap();
+        assert_ref(&r, "localhost:5000", "img", "img", "latest");
+        assert_eq!(r.digest.as_deref(), Some("sha256:abc"));
+        assert_eq!(r.manifest_ref(), "sha256:abc");
+    }
+
+    #[test]
+    fn parse_custom_registry_digest_reference() {
+        let r = parse("ghcr.io/org/app@sha256:deadbeef").unwrap();
+        assert_ref(&r, "ghcr.io", "org/app", "app", "latest");
+        assert_eq!(r.digest.as_deref(), Some("sha256:deadbeef"));
+        // digest 引用时 display_name 不带 tag。
+        assert_eq!(r.display_name(), "org/app@sha256:deadbeef");
+    }
+
+    #[test]
+    fn parse_both_tag_and_digest_prefers_digest() {
+        // tag + digest 同时存在（罕见但合法）：manifest 以 digest 为准。
+        let r = parse("nginx:1.25@sha256:abc").unwrap();
+        assert_ref(&r, HUB, "library/nginx", "nginx", "1.25");
+        assert_eq!(r.manifest_ref(), "sha256:abc");
+    }
+
+    #[test]
+    fn parse_host_only_slash_rejected() {
+        // registry 后跟空仓库路径。
+        assert!(parse("ghcr.io/").is_err());
+    }
+
+    #[test]
+    fn parse_filters_empty_segments_in_path() {
+        // 仓库路径中的连续斜杠会产生空段，应被过滤而不报错/成空。
+        let r = parse("nginx//latest").unwrap();
+        assert_eq!(r.repo_path, "nginx/latest");
+        assert_eq!(r.name, "latest");
+        assert_eq!(r.tag, "latest");
+        // 首尾斜杠同理被折叠。
+        let r2 = parse("/nginx/").unwrap();
+        assert_eq!(r2.repo_path, "library/nginx");
+        assert_eq!(r2.name, "nginx");
+    }
 }

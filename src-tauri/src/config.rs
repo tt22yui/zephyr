@@ -1,4 +1,4 @@
-﻿//! OCI image config blob 解析 —— 对应 docker-tar 的 `ImageConfigBlobFetcher` + 上游的 config 解析。
+//! OCI image config blob 解析 —— 对应 docker-tar 的 `ImageConfigBlobFetcher` + 上游的 config 解析。
 //!
 //! 从 config blob 提取构造 v1 镜像所需的字段：
 //! - `rootfs.diff_ids`：各层解压后的 sha256（顺序即父链顺序：第 0 个是基础层）
@@ -134,5 +134,55 @@ mod tests {
         assert!(cfg.os.is_empty());
         let img = cfg.to_last_v1_image();
         assert_eq!(img.created, None);
+    }
+
+    #[test]
+    fn created_null_is_none() {
+        // `created: null` 应解析为 None，而不是 "null" 字符串或报错。
+        let cfg = OciConfig::from_json(r#"{"created":null,"os":"linux"}"#).unwrap();
+        assert_eq!(cfg.created, None);
+        assert_eq!(cfg.os, "linux");
+        assert!(cfg.diff_ids().is_empty());
+    }
+
+    #[test]
+    fn unknown_extra_keys_ignored() {
+        // 上游可能引入未知字段，解析不应失败，也不应污染已知字段。
+        let json = r#"{
+            "architecture":"arm64","os":"linux",
+            "vendor":"oci","schema_version":2,
+            "rootfs":{"type":"layers","diff_ids":["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}
+        }"#;
+        let cfg = OciConfig::from_json(json).unwrap();
+        assert_eq!(cfg.architecture, "arm64");
+        assert_eq!(cfg.diff_ids().len(), 1);
+    }
+
+    #[test]
+    fn config_present_but_empty_is_some_empty() {
+        // 空对象 config → Some(空 ContainerConfig)，与「缺失」区分开。
+        let cfg = OciConfig::from_json(r#"{"config":{},"rootfs":{"diff_ids":[]}}"#).unwrap();
+        let cc = cfg.config.as_ref().unwrap_or_else(|| panic!("config 键存在时应为 Some"));
+        assert!(cc.env.is_empty());
+        assert!(cc.cmd.is_empty());
+        assert!(cfg.to_last_v1_image().container_config.env.is_empty());
+    }
+
+    #[test]
+    fn missing_config_is_none_and_defaults() {
+        let cfg = OciConfig::from_json(r#"{"os":"linux","rootfs":{}}"#).unwrap();
+        assert!(cfg.config.is_none());
+        assert!(cfg.to_last_v1_image().container_config.env.is_empty());
+    }
+
+    #[test]
+    fn env_order_is_preserved() {
+        // Env 是有序数组，顺序需原样保留。
+        let cfg = OciConfig::from_json(
+            r#"{"config":{"Env":["PATH=/a","A=1","B=2"]}}"#,
+        )
+        .unwrap();
+        let cc = cfg.config.unwrap();
+        assert_eq!(cc.env, vec!["PATH=/a", "A=1", "B=2"]);
     }
 }

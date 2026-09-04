@@ -237,4 +237,52 @@ mod tests {
         let with_id = create_id(&img, CHAIN1, "");
         assert_eq!(with_id, V1ROOT);
     }
+
+    #[test]
+    fn chain_ids_order_sensitive() {
+        // 层顺序决定 ChainID 链，两条顺序相反应得到不同结果。
+        let a = chain_ids(&[D0.to_string(), D1.to_string()]);
+        let b = chain_ids(&[D1.to_string(), D0.to_string()]);
+        assert_ne!(a[1], b[1]);
+        assert_eq!(b.len(), 2);
+        // 首元素恒等于 diffID（无论顺序）。
+        assert_eq!(b[0], D1);
+    }
+
+    #[test]
+    fn create_id_sensitive_to_container_config() {
+        // container_config 参与哈希（按键排序后 byte 级进入 sha256）。
+        let a = {
+            let mut i = base_image();
+            i.container_config.env = vec!["A=1".to_string()];
+            i
+        };
+        let b = {
+            let mut i = base_image();
+            i.container_config.env = vec!["B=1".to_string()];
+            i
+        };
+        assert_ne!(create_id(&a, CHAIN1, ""), create_id(&b, CHAIN1, ""));
+    }
+
+    #[test]
+    fn create_id_sensitive_to_metadata_fields() {
+        // os / author 等元信息也参与哈希；同 config 下仍需决定。
+        let bare = create_id(&base_image(), CHAIN1, V1ROOT);
+        let mut img = base_image();
+        img.author = "zephyr".to_string();
+        assert_ne!(create_id(&img, CHAIN1, V1ROOT), bare);
+    }
+
+    #[test]
+    fn serialized_v1_image_keys_are_sorted() {
+        // CreateID 依赖「按键字典序的 JSON」，锚定 serde_json::Map（BTreeMap）的有序序列化。
+        let img = base_image();
+        let v = serde_json::to_value(&img).unwrap();
+        let obj = v.as_object().unwrap();
+        let keys: Vec<&String> = obj.keys().collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys, sorted, "V1Image JSON 键必须按字典序序列化以对齐 Go map 语义");
+    }
 }

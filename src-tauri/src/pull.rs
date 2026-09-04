@@ -193,12 +193,28 @@ mod tests {
         assert_eq!(default_out_file(&r), "nginx_1.25.tar");
         let r2 = endpoint::parse("ghcr.io/org/app").unwrap();
         assert_eq!(default_out_file(&r2), "org_app_latest.tar");
+        // digest 引用：tag 缺省 latest，仍生成 <repo>_latest.tar
+        let d = endpoint::parse("nginx@sha256:abc").unwrap();
+        assert_eq!(default_out_file(&d), "nginx_latest.tar");
+        // 嵌套命名空间的路径用 `_` 拼接。
+        let deep = endpoint::parse("quay.io/a/b/c:2").unwrap();
+        assert_eq!(default_out_file(&deep), "a_b_c_2.tar");
     }
 
     #[test]
     fn progress_messages_localized() {
         assert_eq!(progress_message("auth", 0, 1), "正在认证…");
+        assert_eq!(progress_message("auth", 1, 1), "认证完成");
+        assert_eq!(progress_message("manifest", 0, 1), "正在获取镜像清单…");
+        assert_eq!(progress_message("manifest", 1, 1), "清单获取完成");
+        assert_eq!(progress_message("config", 0, 1), "正在解析层配置…");
+        assert_eq!(progress_message("config", 1, 1), "配置解析完成");
+        assert_eq!(progress_message("download", 0, 3), "准备下载 3 层");
         assert_eq!(progress_message("blob", 1, 3), "下载层 1/3");
+        // done 超过 total 时按 total 封顶显示。
+        assert_eq!(progress_message("blob", 5, 3), "下载层 3/3");
+        assert_eq!(progress_message("write", 0, 1), "正在打包 tar…");
         assert_eq!(progress_message("write", 1, 1), "打包完成");
+        assert_eq!(progress_message("unknown", 1, 2), "unknown 1/2");
     }
 }

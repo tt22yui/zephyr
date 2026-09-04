@@ -252,4 +252,30 @@ mod tests {
         // 缺少 blob digest 应报错
         assert!(collect(&image, &diff, &blobs[..1], &cdigest, &cfg).is_err());
     }
+
+    #[test]
+    fn single_layer_image() {
+        // 仅一层：parent 为空，top_id 即唯一层 id。
+        let image = endpoint::parse("nginx:latest").unwrap();
+        let diff = vec!["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()];
+        let blobs = diff.clone();
+        let cfg = OciConfig::from_json(r#"{"os":"linux","rootfs":{"diff_ids":["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}}"#).unwrap();
+        let out = collect(&image, &diff, &blobs, "sha256:cfg", &cfg).unwrap();
+        assert_eq!(out.layers.len(), 1);
+        assert!(out.layers[0].parent.is_empty());
+        assert_eq!(out.top_id, out.layers[0].v1_id);
+        // repositories 里该 tag 指向唯一层 id。
+        let r: serde_json::Value = serde_json::from_slice(&out.repositories_json).unwrap();
+        assert_eq!(r["nginx"]["latest"].as_str(), Some(out.top_id.as_str()));
+    }
+
+    #[test]
+    fn extra_blob_digests_tolerated() {
+        // blob digest 多于 diff_id 时不报错，层数仍由 diff_id 决定。
+        let (image, diff, _, cdigest, cfg) = setup();
+        let mut blobs = diff.clone();
+        blobs.push("sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into());
+        let out = collect(&image, &diff, &blobs, &cdigest, &cfg).unwrap();
+        assert_eq!(out.layers.len(), diff.len());
+    }
 }
