@@ -33,6 +33,8 @@ pub struct IndexManifest {
     #[serde(default)]
     pub digest: String,
     #[serde(default)]
+    pub size: u64,
+    #[serde(default)]
     pub platform: Option<Platform>,
     #[serde(default)]
     pub annotations: HashMap<String, String>,
@@ -71,6 +73,20 @@ pub struct Descriptor {
     pub digest: String,
     #[serde(default)]
     pub size: u64,
+}
+
+/// `GET /v2/<repo>/tags/list` 的响应（只取标签名）。
+#[derive(Debug, Deserialize, Default)]
+pub struct TagsList {
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+/// 离线可测：从 tags/list 响应文本提取标签名。
+fn parse_tags_response(body: &str) -> Result<Vec<String>, String> {
+    let v: TagsList =
+        serde_json::from_str(body).map_err(|e| format!("解析 tags 列表失败: {e}"))?;
+    Ok(v.tags)
 }
 
 /// 选出的 manifest 引用：要么是具体 digest，要么回退用 tag。
@@ -289,6 +305,38 @@ impl RegistryClient {
         })
     }
 
+    /// 抓取原始索引（不选架构），供镜像检查（inspect）展示所有可用平台。
+    /// 单架构或按 digest 引用时，返回的索引 `manifests` 为空数组。
+    pub async fn fetch_index(&self) -> Result<OciIndex, String> {
+        let (index, _) = self
+            .get_json::<OciIndex>(
+                &self.manifest_url(self.image.manifest_ref()),
+                "application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.index.v1+json",
+            )
+            .await?;
+        Ok(index)
+    }
+
+    /// 列出该仓库的标签。部分 registry 禁用 `tags/list`，此时返回空列表，不视为失败。
+    pub async fn list_tags(&self) -> Result<Vec<String>, String> {
+        let url = format!(
+            "{}/v2/{}/tags/list?n=1000",
+            self.endpoint(),
+            self.image.repo_path
+        );
+        let mut req = self.http.get(&url);
+        if !self.token.is_empty() {
+            req = req.bearer_auth(&self.token);
+        }
+        let resp = req.send().await.map_err(|e| format!("请求 tags 列表失败: {e}"))?;
+        if !resp.status().is_success() {
+            // tags/list 非 200（常被 registry 禁用或需额外权限）：不作为硬失败。
+            return Ok(Vec::new());
+        }
+        let body = resp.text().await.map_err(|e| format!("读取 tags 列表失败: {e}"))?;
+        parse_tags_response(&body)
+    }
+
     /// 拉取 config blob 原始字节（与 digest 对应）。
     pub async fn fetch_blob(&self, digest: &str) -> Result<Vec<u8>, String> {
         let url = format!(
@@ -414,5 +462,22 @@ mod tests {
         assert_eq!(m.config.digest, "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
         assert_eq!(m.layers.len(), 1);
         assert_eq!(m.layers[0].media_type, "application/vnd.docker.image.rootfs.diff.tar.gzip");
+    }
+
+    #[test]
+    fn parse_tags_response_extracts_names() {
+        let out = parse_tags_response(r#"{"name":"library/nginx","tags":["latest","1.25","stable"]}"#).unwrap();
+        assert_eq!(out, vec!["latest", "1.25", "stable"]);
+    }
+
+    #[test]
+    fn parse_tags_response_missing_tags_is_empty() {
+        let out = parse_tags_response(r#"{"name":"library/nginx"}"#).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn parse_tags_response_rejects_bad_json() {
+        assert!(parse_tags_response("not json").is_err());
     }
 }

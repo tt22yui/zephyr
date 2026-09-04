@@ -77,15 +77,23 @@ fn clamp_page_size(page_size: u32) -> u32 {
 }
 
 /// 在 Docker Hub 搜索镜像仓库。query 为空时直接返回空列表。
-pub async fn search(query: &str, page_size: u32) -> Result<Vec<SearchResult>, String> {
+///
+/// `base` 可指定自定义搜索端点（如第三方 registry 提供的搜索地址）；
+/// 为 `None` 时使用 Docker Hub 公开搜索 API。
+pub async fn search(
+    query: &str,
+    page_size: u32,
+    base: Option<&str>,
+) -> Result<Vec<SearchResult>, String> {
     let q = query.trim();
     if q.is_empty() {
         return Ok(Vec::new());
     }
     let size = clamp_page_size(page_size);
+    let base_url = base.unwrap_or(HUB_SEARCH_URL);
 
     let url = Url::parse_with_params(
-        HUB_SEARCH_URL,
+        base_url,
         &[("query", q), ("page_size", &size.to_string())],
     )
     .map_err(|e| format!("构造搜索地址失败: {e}"))?;
@@ -97,7 +105,7 @@ pub async fn search(query: &str, page_size: u32) -> Result<Vec<SearchResult>, St
         .await
         .map_err(|e| format!("搜索请求失败（请检查网络/代理）: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!("Docker Hub 搜索接口返回 {}", resp.status()));
+        return Err(format!("镜像库搜索接口返回 {}", resp.status()));
     }
     let body = resp
         .text()
@@ -111,8 +119,9 @@ pub async fn search(query: &str, page_size: u32) -> Result<Vec<SearchResult>, St
 pub async fn search_image(
     query: String,
     page_size: Option<u32>,
+    base: Option<String>,
 ) -> Result<Vec<SearchResult>, String> {
-    search(&query, page_size.unwrap_or(DEFAULT_PAGE_SIZE)).await
+    search(&query, page_size.unwrap_or(DEFAULT_PAGE_SIZE), base.as_deref()).await
 }
 
 #[cfg(test)]

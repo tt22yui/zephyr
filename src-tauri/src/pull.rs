@@ -66,9 +66,13 @@ fn progress_message(name: &str, done: u64, total: u64) -> String {
 }
 
 /// 执行拉取。`progress(name, done, total)` 作为进度回调整体上报。
+///
+/// 输出文件解析规则：显式 `out_file` 优先；其次 `out_dir` 目录 + 缺省文件名；
+/// 两者都缺省时写到当前目录。
 pub async fn pull(
     image: &str,
     out_file: Option<String>,
+    out_dir: Option<String>,
     arch: String,
     use_http: bool,
     username: Option<String>,
@@ -123,9 +127,10 @@ pub async fn pull(
     let collected = collect::collect(&image_ref, &diff_ids, &blob_digests, &config_digest, &cfg)?;
 
     // 7) 并发下载 + 打包
-    let tar_path = match out_file {
-        Some(p) => PathBuf::from(p),
-        None => PathBuf::from(default_out_file(&image_ref)),
+    let tar_path = match (out_file, out_dir) {
+        (Some(p), _) => PathBuf::from(p),
+        (None, Some(dir)) => PathBuf::from(dir).join(default_out_file(&image_ref)),
+        (None, None) => PathBuf::from(default_out_file(&image_ref)),
     };
     output::write_tar(
         &client,
@@ -152,6 +157,7 @@ pub async fn pull_image(
     app: tauri::AppHandle,
     image: String,
     out_file: Option<String>,
+    out_dir: Option<String>,
     arch: Option<String>,
     use_http: Option<bool>,
     username: Option<String>,
@@ -174,6 +180,7 @@ pub async fn pull_image(
     pull(
         &image,
         out_file,
+        out_dir,
         arch,
         use_http,
         username,
