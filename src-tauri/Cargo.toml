@@ -1,6 +1,6 @@
 [package]
 name = "zephyr"
-version = "0.1.5"
+version = "0.1.6"
 description = "泽帆 Zephyr — Pull Docker images without a daemon, export to docker save v1 tar."
 authors = ["Zephyr Contributors"]
 edition = "2021"
